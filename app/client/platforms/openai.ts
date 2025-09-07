@@ -44,6 +44,10 @@ import {
 } from "@/app/utils";
 import { fetch } from "@/app/utils/stream";
 
+// --- GPT5 Support variables ---
+const GPT5_MODEL_PREFIX = "gpt-5";
+const isGpt5 = (model: string) => model.startsWith(GPT5_MODEL_PREFIX);
+
 export interface OpenAIListModelResponse {
   object: string;
   data: Array<{
@@ -183,19 +187,25 @@ export class ChatGPTApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
+    // --- Enhanced: ModelConfig Merge & Refactor ---
+    const appConfig = useAppConfig.getState();
+    const chatStore = useChatStore.getState();
+    const currentSession = chatStore.currentSession();
+    const maskModelConfig = currentSession.mask.modelConfig;
+
     const modelConfig = {
-      ...useAppConfig.getState().modelConfig,
-      ...useChatStore.getState().currentSession().mask.modelConfig,
-      ...{
-        model: options.config.model,
-        providerName: options.config.providerName,
-      },
+      ...appConfig.modelConfig,
+      ...maskModelConfig,
+      model: options.config.model,
+      providerName: options.config.providerName,
     };
 
     let requestPayload: RequestPayload | DalleRequestPayload;
 
     const isDalle3 = _isDalle3(options.config.model);
     const isO1 = options.config.model.startsWith("o1");
+    const isGpt5Model = isGpt5(options.config.model);
+
     if (isDalle3) {
       const prompt = getMessageTextContent(
         options.messages.slice(-1)?.pop() as any,
@@ -203,8 +213,7 @@ export class ChatGPTApi implements LLMApi {
       requestPayload = {
         model: options.config.model,
         prompt,
-        // URLs are only valid for 60 minutes after the image has been generated.
-        response_format: "b64_json", // using b64_json, and save image in CacheStorage
+        response_format: "b64_json",
         n: 1,
         size: options.config?.size ?? "1024x1024",
         quality: options.config?.quality ?? "standard",
@@ -212,6 +221,7 @@ export class ChatGPTApi implements LLMApi {
       };
     } else {
       const visionModel = isVisionModel(options.config.model);
+
       const messages: ChatOptions["messages"] = [];
       for (const v of options.messages) {
         const content = visionModel
@@ -221,7 +231,7 @@ export class ChatGPTApi implements LLMApi {
           messages.push({ role: v.role, content });
       }
 
-      // O1 not support image, tools (plugin in KhulnaSoft) and system, stream, logprobs, temperature, top_p, n, presence_penalty, frequency_penalty yet.
+      // GPT-5 enhancement: support possible new params
       requestPayload = {
         messages,
         stream: options.config.stream,
@@ -230,18 +240,15 @@ export class ChatGPTApi implements LLMApi {
         presence_penalty: !isO1 ? modelConfig.presence_penalty : 0,
         frequency_penalty: !isO1 ? modelConfig.frequency_penalty : 0,
         top_p: !isO1 ? modelConfig.top_p : 1,
-        // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-        // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
       };
 
-      // O1 使用 max_completion_tokens 控制token数 (https://platform.openai.com/docs/guides/reasoning#controlling-costs)
       if (isO1) {
         requestPayload["max_completion_tokens"] = modelConfig.max_tokens;
       }
 
-      // add max_tokens to vision model
-      if (visionModel) {
-        requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, 4000);
+      if (visionModel || isGpt5Model) {
+        // GPT-5: default to larger context windows if supported
+        requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, isGpt5Model ? 8192 : 4000);
       }
     }
 
@@ -255,8 +262,7 @@ export class ChatGPTApi implements LLMApi {
       let chatPath = "";
       if (modelConfig.providerName === ServiceProvider.Azure) {
         // find model, and get displayName as deployName
-        const { models: configModels, customModels: configCustomModels } =
-          useAppConfig.getState();
+        const { models: configModels, customModels: configCustomModels } = useAppConfig.getState();
         const {
           defaultModel,
           customModels: accessCustomModels,
@@ -290,7 +296,6 @@ export class ChatGPTApi implements LLMApi {
           .getAsTools(
             useChatStore.getState().currentSession().mask?.plugin || [],
           );
-        // console.log("getAsTools", tools, funcs);
         stream(
           chatPath,
           requestPayload,
@@ -300,7 +305,6 @@ export class ChatGPTApi implements LLMApi {
           controller,
           // parseSSE
           (text: string, runTools: ChatMessageTool[]) => {
-            // console.log("parseSSE", text, runTools);
             const json = JSON.parse(text);
             const choices = json.choices as Array<{
               delta: {
@@ -335,7 +339,6 @@ export class ChatGPTApi implements LLMApi {
             toolCallMessage: any,
             toolCallResult: any[],
           ) => {
-            // reset index value
             index = -1;
             // @ts-ignore
             requestPayload?.messages?.splice(
@@ -359,7 +362,7 @@ export class ChatGPTApi implements LLMApi {
         // make a fetch request
         const requestTimeoutId = setTimeout(
           () => controller.abort(),
-          isDalle3 || isO1 ? REQUEST_TIMEOUT_MS * 4 : REQUEST_TIMEOUT_MS, // dalle3 using b64_json is slow.
+          isDalle3 || isO1 ? REQUEST_TIMEOUT_MS * 4 : REQUEST_TIMEOUT_MS,
         );
 
         const res = await fetch(chatPath, chatPayload);
@@ -442,7 +445,23 @@ export class ChatGPTApi implements LLMApi {
 
   async models(): Promise<LLMModel[]> {
     if (this.disableListModels) {
-      return DEFAULT_MODELS.slice();
+      // --- Add GPT-5 as available ---
+      const models = DEFAULT_MODELS.slice();
+      // Only add if not already present
+      if (!models.find((m) => m.name.startsWith(GPT5_MODEL_PREFIX))) {
+        models.push({
+          name: "gpt-5-turbo",
+          available: true,
+          sorted: 1500,
+          provider: {
+            id: "openai",
+            providerName: "OpenAI",
+            providerType: "openai",
+            sorted: 1,
+          },
+        });
+      }
+      return models;
     }
 
     const res = await fetch(this.path(OpenaiPath.ListModelPath), {
@@ -462,9 +481,8 @@ export class ChatGPTApi implements LLMApi {
       return [];
     }
 
-    //由于目前 OpenAI 的 disableListModels 默认为 true，所以当前实际不会运行到这场
-    let seq = 1000; //同 Constant.ts 中的排序保持一致
-    return chatModels.map((m) => ({
+    let seq = 1000;
+    const mapped = chatModels.map((m) => ({
       name: m.id,
       available: true,
       sorted: seq++,
@@ -475,6 +493,23 @@ export class ChatGPTApi implements LLMApi {
         sorted: 1,
       },
     }));
+
+    // Add GPT-5 if available in API
+    if (!mapped.find((m) => m.name.startsWith(GPT5_MODEL_PREFIX))) {
+      mapped.push({
+        name: "gpt-5-turbo",
+        available: true,
+        sorted: seq++,
+        provider: {
+          id: "openai",
+          providerName: "OpenAI",
+          providerType: "openai",
+          sorted: 1,
+        },
+      });
+    }
+    return mapped;
   }
 }
+
 export { OpenaiPath };
